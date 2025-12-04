@@ -38,6 +38,13 @@ from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
+# Add project root to path for FontCore imports (works for root and subdirectory scripts)
+_project_root = Path(__file__).parent
+while not (_project_root / "FontCore").exists() and _project_root.parent != _project_root:
+    _project_root = _project_root.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
 from FontCore.core_name_policies import (
     sanitize_postscript,
     strip_variable_tokens,
