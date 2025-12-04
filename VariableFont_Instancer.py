@@ -38,16 +38,16 @@ from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
-from core.core_name_policies import (
+from FontCore.core_name_policies import (
     sanitize_postscript,
     strip_variable_tokens,
     normalize_fvar_name,
 )
-from core.core_ttx_table_io import deduplicate_namerecords_binary
-from core.core_file_collector import collect_font_files
-from core.core_error_handling import ErrorTracker, ErrorContext
-import core.core_console_styles as cs
-from core.core_console_styles import StatusIndicator
+from FontCore.core_ttx_table_io import deduplicate_namerecords_binary
+from FontCore.core_file_collector import collect_font_files
+from FontCore.core_error_handling import ErrorTracker, ErrorContext
+import FontCore.core_console_styles as cs
+from FontCore.core_console_styles import StatusIndicator
 
 logger = cs.get_logger(__name__)
 console = cs.get_console()
@@ -1224,7 +1224,7 @@ class InteractivePrompt:
                 or "Unknown"
             )
             # Strip variable font suffixes
-            from core.core_name_policies import strip_variable_tokens
+            from FontCore.core_name_policies import strip_variable_tokens
 
             family_name = strip_variable_tokens(family_name) or family_name
             temp_font.close()
