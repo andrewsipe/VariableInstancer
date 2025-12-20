@@ -502,7 +502,9 @@ class FamilyContext:
         self.stat_parser = stat_parser
         self._weight_groups = self._build_weight_groups()
 
-    def _build_weight_groups(self) -> Dict[Tuple[Tuple[str, float], ...], List[InstanceInfo]]:
+    def _build_weight_groups(
+        self,
+    ) -> Dict[Tuple[Tuple[str, float], ...], List[InstanceInfo]]:
         """Group instances by non-weight coordinates."""
         groups: Dict[Tuple[Tuple[str, float], ...], List[InstanceInfo]] = {}
 
@@ -1047,7 +1049,8 @@ class InteractivePrompt:
                 )
 
                 names_differ = (
-                    normalized_fvar != inst.stat_name and normalized_fvar != UNKNOWN_FVAR_NAME
+                    normalized_fvar != inst.stat_name
+                    and normalized_fvar != UNKNOWN_FVAR_NAME
                 )
 
                 # Apply highlighting to cells when names differ
@@ -1083,7 +1086,7 @@ class InteractivePrompt:
                 has_modifications = any(
                     self._build_hybrid_name_for_display(inst) != inst.fvar_name
                     for inst in self.metadata.instances
-                    if inst.fvar_name != "Unknown"
+                    if inst.fvar_name != UNKNOWN_FVAR_NAME
                 )
                 if has_modifications:
                     cs.emit("")
@@ -1835,7 +1838,7 @@ class InstanceGenerator:
         counter = 1
         max_attempts = 1000  # Prevent infinite loops
         attempts = 0
-        
+
         while attempts < max_attempts:
             # Check if file exists (for initial duplicate detection)
             if output_path.exists():
@@ -1845,12 +1848,12 @@ class InstanceGenerator:
                 counter += 1
                 attempts += 1
                 continue
-            
+
             # Dry-run mode: log what would be saved without actually saving
             if self.config.dry_run:
                 logger.info(f"[DRY-RUN] Would save: {output_path}")
                 return str(output_path)
-            
+
             # Attempt to save with race condition handling
             try:
                 font.save(str(output_path))
@@ -1863,11 +1866,15 @@ class InstanceGenerator:
                 output_path = output_dir / filename
                 counter += 1
                 attempts += 1
-                logger.debug(f"Race condition detected, retrying with filename: {filename}")
+                logger.debug(
+                    f"Race condition detected ({type(e).__name__}: {e}), retrying with filename: {filename}"
+                )
                 continue
-        
+
         # If we've exhausted attempts, raise an error
-        raise RuntimeError(f"Could not save file after {max_attempts} attempts. Last attempted path: {output_path}")
+        raise RuntimeError(
+            f"Could not save file after {max_attempts} attempts. Last attempted path: {output_path}"
+        )
 
 
 # ============================================================================
@@ -1935,7 +1942,9 @@ class FontProcessor:
             if output_path:
                 filename = Path(output_path).name
                 cs.emit("")
-                status_msg = f"{dry_run_prefix}Generated" if dry_run_prefix else "Generated"
+                status_msg = (
+                    f"{dry_run_prefix}Generated" if dry_run_prefix else "Generated"
+                )
                 StatusIndicator("success").add_message(status_msg).add_file(
                     filename, filename_only=True
                 ).emit()
