@@ -92,6 +92,13 @@ class WeightClass:
         return abs(weight - WeightClass.BOLD) < 0.5
 
 
+# Magic value constants
+UNKNOWN_FVAR_NAME = "Unknown"
+AXIS_VALUE_EPSILON = 0.5
+ITALIC_ANGLE_THRESHOLD = 0.1
+ITALIC_ANGLE_MIN = 0.01
+
+
 @dataclass
 class InstancerConfig:
     """Configuration for instance processing."""
@@ -209,11 +216,25 @@ class STATNameParser:
                 self._extract_axis_value_name(axis_value)
 
     def _extract_axis_value_name(self, axis_value) -> None:
-        """Extract name from a single AxisValue record."""
+        """Extract name from a single AxisValue record.
+
+        Attempts to retrieve the name string for a STAT table AxisValue record
+        using the ValueNameID. If extraction fails (nameID doesn't exist or
+        name record is missing), logs a debug message and returns silently.
+
+        This can fail when:
+        - The nameID references a non-existent name record
+        - The name table is incomplete or malformed
+        - The font uses platform-specific encoding that getDebugName() can't decode
+
+        Args:
+            axis_value: AxisValue record from STAT table with ValueNameID attribute
+        """
         name_id = axis_value.ValueNameID
         value_name = self.font["name"].getDebugName(name_id)
 
         if not value_name:
+            logger.debug(f"Could not extract STAT value name for nameID {name_id}")
             return
 
         # Get axis tag via index
@@ -223,7 +244,7 @@ class STATNameParser:
                 self.stat_values[axis_tag][axis_value.Value] = value_name
 
     def get_label_for_axis(
-        self, axis_tag: str, value: float, epsilon: float = 0.5
+        self, axis_tag: str, value: float, epsilon: float = AXIS_VALUE_EPSILON
     ) -> Optional[str]:
         """Get STAT label for specific axis/value."""
         axis_map = self.stat_values.get(axis_tag)
@@ -339,27 +360,26 @@ class STATNameParser:
         except Exception:
             return None
 
-    def _compose_name_parts(
-        self,
-        labels: Dict[str, str],
-        coordinates: Dict[str, float],
-        metadata: Optional["FontMetadata"] = None,
-    ) -> str:
-        """Compose name parts in canonical order with family awareness."""
-        parts: List[str] = []
-
-        # Define suppressible terms per axis type
+    def _should_suppress_width(self, width: str) -> bool:
+        """Check if width label should be suppressed (contains suppressible terms)."""
         WIDTH_SUPPRESSIBLE = {"regular", "normal", "standard", "roman"}
+        width_lower = width.strip().lower()
+        return any(term in width_lower for term in WIDTH_SUPPRESSIBLE)
+
+    def _should_suppress_slope(self, slope: str) -> bool:
+        """Check if slope label should be suppressed (contains suppressible terms)."""
         SLOPE_SUPPRESSIBLE = {"roman", "upright", "normal", "regular"}
-        # Weight terms are NEVER suppressed - keep all weight labels
+        slope_lower = slope.strip().lower()
+        return any(term in slope_lower for term in SLOPE_SUPPRESSIBLE)
 
-        # Get coordinate values for context
-        wght_value = coordinates.get("wght", 400.0)
+    def _determine_family_weight_context(
+        self, metadata: Optional["FontMetadata"]
+    ) -> Tuple[bool, bool]:
+        """Determine if family has heavier or lighter weights than Regular (400).
 
-        # Determine if instance is at Regular weight
-        is_regular_weight = wght_value == 400.0
-
-        # Check family context if available
+        Returns:
+            Tuple of (has_heavier_weights, has_lighter_weights)
+        """
         has_heavier_weights = False
         has_lighter_weights = False
 
@@ -372,19 +392,21 @@ class STATNameParser:
                 if inst_wght < 400.0:
                     has_lighter_weights = True
 
-        # Width (suppress specific terms)
-        width = labels.get("wdth")
-        if width:
-            # Check if width contains suppressible terms
-            width_lower = width.strip().lower()
-            width_is_suppressible = any(
-                term in width_lower for term in WIDTH_SUPPRESSIBLE
-            )
-            if not width_is_suppressible:
-                parts.append(width)
+        return (has_heavier_weights, has_lighter_weights)
 
-        # Weight processing - NEVER suppress weight terms, but clean up "Normal" prefix
-        weight = labels.get("wght")
+    def _process_weight_label(
+        self, weight: Optional[str], is_regular_weight: bool, has_other_weights: bool
+    ) -> Optional[str]:
+        """Process weight label: clean up "Normal" prefix and handle Regular weight.
+
+        Args:
+            weight: Weight label from STAT table (may be None)
+            is_regular_weight: Whether this instance is at Regular weight (400)
+            has_other_weights: Whether family has other weight variants
+
+        Returns:
+            Processed weight label, or None if no weight should be added
+        """
         if weight:
             # Clean up "Normal" prefix from weight labels like "Normal Thin" -> "Thin"
             weight_cleaned = weight.strip()
@@ -393,26 +415,75 @@ class STATNameParser:
             elif weight_cleaned.lower() == "normal":
                 # Replace standalone "Normal" with "Regular" for weight axis
                 weight_cleaned = "Regular"
-            parts.append(weight_cleaned)
-        elif is_regular_weight and (has_heavier_weights or has_lighter_weights):
+            return weight_cleaned
+        elif is_regular_weight and has_other_weights:
             # No weight label found, but this is Regular weight in a family with other weights
-            parts.append("Regular")
+            return "Regular"
+        return None
+
+    def _compose_name_parts(
+        self,
+        labels: Dict[str, str],
+        coordinates: Dict[str, float],
+        metadata: Optional["FontMetadata"] = None,
+    ) -> str:
+        """Compose name parts in canonical order with family awareness.
+
+        Decision tree for "Regular" insertion:
+        1. If weight label exists, use it (after cleaning "Normal" prefix)
+        2. If no weight label but weight=400 and family has other weights, add "Regular"
+        3. Width labels are suppressed if they contain suppressible terms
+        4. Slope labels are suppressed if they contain suppressible terms
+        5. If only slope remains and family has other weights, prefix with "Regular"
+
+        Args:
+            labels: Dictionary mapping axis tags to their STAT-derived labels
+            coordinates: Dictionary mapping axis tags to coordinate values
+            metadata: Optional font metadata for family context
+
+        Returns:
+            Composed subfamily name string
+        """
+        parts: List[str] = []
+
+        # Get coordinate values for context
+        wght_value = coordinates.get("wght", 400.0)
+        is_regular_weight = wght_value == 400.0
+
+        # Determine family weight context
+        has_heavier_weights, has_lighter_weights = (
+            self._determine_family_weight_context(metadata)
+        )
+        has_other_weights = has_heavier_weights or has_lighter_weights
+
+        # Width (suppress specific terms)
+        width = labels.get("wdth")
+        if width and not self._should_suppress_width(width):
+            parts.append(width)
+
+        # Weight processing - NEVER suppress weight terms, but clean up "Normal" prefix
+        # Decision: Add weight label if present, or add "Regular" if weight=400 and
+        # family has other weights (to distinguish Regular from other weights)
+        weight = labels.get("wght")
+        processed_weight = self._process_weight_label(
+            weight, is_regular_weight, has_other_weights
+        )
+        if processed_weight:
+            parts.append(processed_weight)
 
         # Slope (suppress specific terms)
+        # Only add slope if it doesn't contain suppressible terms like "roman", "upright"
         slope = labels.get("slnt") or labels.get("ital") or labels.get("obli")
-        if slope:
-            slope_lower = slope.strip().lower()
-            slope_is_suppressible = any(
-                term in slope_lower for term in SLOPE_SUPPRESSIBLE
-            )
-            if not slope_is_suppressible:
-                parts.append(slope)
+        if slope and not self._should_suppress_slope(slope):
+            parts.append(slope)
 
-        # If only slope, add "Regular" prefix if family has non-Regular weights
+        # Special case: If only slope remains (no width, no weight), and family has
+        # other weights, prefix with "Regular" to indicate this is Regular weight
+        # Example: "Italic" → "Regular Italic" (when family also has "Bold Italic")
+        # (Re-check slope since we may have added it above)
         slope = labels.get("slnt") or labels.get("ital") or labels.get("obli")
-        if len(parts) == 1 and slope and (has_heavier_weights or has_lighter_weights):
-            slope_is_suppressible = slope.strip().lower() in SLOPE_SUPPRESSIBLE
-            if not slope_is_suppressible:
+        if len(parts) == 1 and slope and has_other_weights:
+            if not self._should_suppress_slope(slope):
                 parts.insert(0, "Regular")
 
         return " ".join(parts) if parts else "Regular"
@@ -431,9 +502,9 @@ class FamilyContext:
         self.stat_parser = stat_parser
         self._weight_groups = self._build_weight_groups()
 
-    def _build_weight_groups(self) -> Dict[tuple, List[InstanceInfo]]:
+    def _build_weight_groups(self) -> Dict[Tuple[Tuple[str, float], ...], List[InstanceInfo]]:
         """Group instances by non-weight coordinates."""
-        groups: Dict[tuple, List[InstanceInfo]] = {}
+        groups: Dict[Tuple[Tuple[str, float], ...], List[InstanceInfo]] = {}
 
         for inst in self.instances:
             key = self._group_key(inst.coordinates)
@@ -443,7 +514,7 @@ class FamilyContext:
 
         return groups
 
-    def _group_key(self, coords: Dict[str, float]) -> tuple:
+    def _group_key(self, coords: Dict[str, float]) -> Tuple[Tuple[str, float], ...]:
         """Create grouping key from non-weight coordinates."""
         items = [(k, float(v)) for k, v in coords.items() if k != "wght"]
         items = [(k, round(v, 4)) for k, v in items]
@@ -485,17 +556,23 @@ class FamilyContext:
 
     def build_hybrid_name(self, inst: InstanceInfo) -> str:
         """Build hybrid name: fvar base with STAT-derived completions."""
-        if inst.fvar_name == "Unknown":
+        if inst.fvar_name == UNKNOWN_FVAR_NAME:
             return inst.stat_name
 
         base = inst.fvar_name.strip()
 
-        # Check if we should add Regular
+        # Decision: Should we add "Regular" to this name?
+        # This is determined by should_add_regular() which checks:
+        # 1. Weight is 400 (Regular weight)
+        # 2. Name doesn't already contain "Regular"
+        # 3. Other instances in same group have different weights (family context)
         if not self.should_add_regular(inst):
             return base
 
-        # Intelligently insert "Regular" in the correct position
-        # Check if name ends with a slope term (Italic/Oblique/Slanted)
+        # Position logic for "Regular" insertion:
+        # We want to maintain canonical order: Width → Weight → Slope
+        # If the name ends with a slope term, insert "Regular" before it
+        # Otherwise, append "Regular" at the end
         slope_terms = ["italic", "oblique", "slanted"]
 
         # Split into words to check if last word is a slope term
@@ -508,19 +585,22 @@ class FamilyContext:
 
         # Check if last word is a slope term
         if last_word_lower in slope_terms:
-            # Insert "Regular" before the slope term
+            # Insert "Regular" before the slope term to maintain canonical order
             if len(words) > 1:
                 # Name has content before slope: "Inktrap Italic" -> "Inktrap Regular Italic"
+                # This preserves any width/other terms that come before the slope
                 before_slope = " ".join(words[:-1])
                 slope_original = words[-1]
                 return f"{before_slope} Regular {slope_original}"
             else:
                 # Pure slope name: "Italic" -> "Regular Italic"
+                # When only slope exists, prefix with "Regular" to indicate weight
                 slope_original = words[0]
                 return f"Regular {slope_original}"
         else:
             # No slope term, append "Regular" at the end
             # "Inktrap" -> "Inktrap Regular"
+            # This handles cases where name has width/other terms but no slope
             return f"{base} Regular"
 
 
@@ -603,7 +683,7 @@ class FontAnalyzer:
         fvar = self.font["fvar"]
 
         for i, instance in enumerate(fvar.instances):
-            fvar_name = "Unknown"
+            fvar_name = UNKNOWN_FVAR_NAME
             if hasattr(instance, "subfamilyNameID") and instance.subfamilyNameID:
                 try:
                     # Try getDebugName first
@@ -632,7 +712,7 @@ class FontAnalyzer:
                                 fvar_name = name_record.toUnicode()
                 except Exception as e:
                     logger.debug(f"Failed to extract fvar name for instance {i}: {e}")
-                    fvar_name = "Unknown"
+                    fvar_name = UNKNOWN_FVAR_NAME
 
             stat_name = self.stat_parser.build_subfamily_name(instance.coordinates)
             is_italic = self._detect_italic(instance.coordinates)
@@ -665,7 +745,7 @@ class FontAnalyzer:
         if "post" in self.font and hasattr(self.font["post"], "italicAngle"):
             try:
                 angle = self.font["post"].italicAngle
-                return abs(angle) > 0.1
+                return abs(angle) > ITALIC_ANGLE_THRESHOLD
             except (AttributeError, TypeError):
                 pass
         return False
@@ -715,7 +795,7 @@ class InstanceNamingStrategy:
             return inst.stat_name
 
         elif self.mode == NamingMode.FVAR_HYBRID:
-            if inst.fvar_name != "Unknown":
+            if inst.fvar_name != UNKNOWN_FVAR_NAME:
                 # Normalize fvar name before applying hybrid logic
                 normalized_fvar = normalize_fvar_name(
                     inst.fvar_name,
@@ -735,7 +815,7 @@ class InstanceNamingStrategy:
             return inst.stat_name
 
         elif self.mode == NamingMode.FVAR_RAW:
-            if inst.fvar_name != "Unknown":
+            if inst.fvar_name != UNKNOWN_FVAR_NAME:
                 # Normalize fvar name for filename generation
                 return normalize_fvar_name(
                     inst.fvar_name,
@@ -798,7 +878,7 @@ class InteractivePrompt:
 
         # Naming explanation if fvar names exist
         has_fvar_names = any(
-            inst.fvar_name != "Unknown" for inst in self.metadata.instances
+            inst.fvar_name != UNKNOWN_FVAR_NAME for inst in self.metadata.instances
         )
         if has_fvar_names:
             cs.emit("\nNaming Note:")
@@ -820,7 +900,7 @@ class InteractivePrompt:
 
         # Check if any instances have fvar names (show column if they exist)
         has_fvar_names = any(
-            inst.fvar_name != "Unknown" for inst in self.metadata.instances
+            inst.fvar_name != UNKNOWN_FVAR_NAME for inst in self.metadata.instances
         )
 
         # Print table with naming comparison
@@ -881,7 +961,7 @@ class InteractivePrompt:
 
     def _build_hybrid_name_for_display(self, inst: InstanceInfo) -> str:
         """Build hybrid name for display with bold for added words."""
-        if inst.fvar_name == "Unknown":
+        if inst.fvar_name == UNKNOWN_FVAR_NAME:
             return "N/A"
 
         # First normalize the fvar name to remove suppressible terms
@@ -929,7 +1009,7 @@ class InteractivePrompt:
                     bolded_hybrid = re.sub(r"\bRegular\b", "*Regular*", hybrid)
                     return bolded_hybrid
 
-        return normalized_fvar if normalized_fvar != "Unknown" else "N/A"
+        return normalized_fvar if normalized_fvar != UNKNOWN_FVAR_NAME else "N/A"
 
     def _print_instances_table_with_naming(self, show_naming_comparison: bool) -> None:
         """Print instances table with optional naming comparison."""
@@ -962,12 +1042,12 @@ class InteractivePrompt:
                         stat_values=self.metadata.stat_values,
                         coordinates=inst.coordinates,
                     )
-                    if inst.fvar_name != "Unknown"
-                    else "Unknown"
+                    if inst.fvar_name != UNKNOWN_FVAR_NAME
+                    else UNKNOWN_FVAR_NAME
                 )
 
                 names_differ = (
-                    normalized_fvar != inst.stat_name and normalized_fvar != "Unknown"
+                    normalized_fvar != inst.stat_name and normalized_fvar != UNKNOWN_FVAR_NAME
                 )
 
                 # Apply highlighting to cells when names differ
@@ -1016,7 +1096,7 @@ class InteractivePrompt:
             for inst in self.metadata.instances:
                 ribbi = self._get_ribbi_label(inst)
                 cs.emit(f"  {inst.index + 1:2}. {inst.stat_name:25} [{ribbi:12}]")
-                if show_naming_comparison and inst.fvar_name != "Unknown":
+                if show_naming_comparison and inst.fvar_name != UNKNOWN_FVAR_NAME:
                     hybrid = self._build_hybrid_name_for_display(inst)
                     cs.emit(f"      fvar: {hybrid}")
                 cs.emit(f"      {inst.format_coordinates()}")
@@ -1026,11 +1106,29 @@ class InteractivePrompt:
     ) -> Optional[List[Tuple[int, NamingMode]]]:
         """Parse instance selection with optional naming prefixes.
 
-        Supports multiple formats:
-        - Simple numbers: "1,2,3" or "1 2 3"
-        - Mode prefixes: "stat:1,2,3" or "fvar:4,5,6"
-        - Per-instance: "1s 2f 3r" (s=STAT, f=fvar, r=raw)
-        - Mixed: "stat:1,2 fvar:3 4s"
+        Parses user input for selecting specific instances with optional naming mode
+        specifications. Returns None if parsing fails or input is invalid.
+
+        Supported formats:
+        - Simple numbers: "1,2,3" or "1 2 3" (uses default/current mode)
+        - Mode prefixes: "stat:1,2,3" or "fvar:4,5,6" (sets mode for those numbers)
+        - Per-instance suffixes: "1s 2f 3r" (s=STAT, f=fvar-hybrid, r=fvar-raw)
+        - Per-instance prefixes: "s1 f2 r3" (same as above, different order)
+        - Mode change tokens: "s 1 2" or "fvar 3 4" (sets current mode, then numbers)
+        - Mixed: "stat:1,2 fvar:3 4s" (combines multiple formats)
+
+        Examples:
+            "1,2,3" → [(0, STAT), (1, STAT), (2, STAT)]
+            "stat:1,2 fvar:3" → [(0, STAT), (1, STAT), (2, FVAR_HYBRID)]
+            "1s 2f 3r" → [(0, STAT), (1, FVAR_HYBRID), (2, FVAR_RAW)]
+            "s 1 2 3" → [(0, STAT), (1, STAT), (2, STAT)]
+
+        Args:
+            response: User input string to parse
+            allow_naming: If False, ignores naming mode specs and uses STAT for all
+
+        Returns:
+            List of (instance_index, naming_mode) tuples, or None if parsing fails
         """
         # Normalize input
         normalized = response.replace(",", " ")
@@ -1231,7 +1329,7 @@ class InteractivePrompt:
             family_name = (
                 temp_font["name"].getDebugName(1)
                 or temp_font["name"].getDebugName(16)
-                or "Unknown"
+                or UNKNOWN_FVAR_NAME
             )
             # Strip variable font suffixes
             from FontCore.core_name_policies import strip_variable_tokens
@@ -1354,7 +1452,7 @@ class InteractivePrompt:
 
         # Check for instances with no STAT mapping
         for inst in self.metadata.instances:
-            if inst.stat_name == "Regular" and inst.fvar_name != "Unknown":
+            if inst.stat_name == "Regular" and inst.fvar_name != UNKNOWN_FVAR_NAME:
                 # Check if this is a fallback due to missing STAT values
                 has_non_default = any(
                     coord != axis.default_value
@@ -1445,7 +1543,7 @@ class InstanceGenerator:
 
             # Detect italic from result
             italic_angle = instance_font["post"].italicAngle
-            is_italic = abs(italic_angle) > 0.1
+            is_italic = abs(italic_angle) > ITALIC_ANGLE_THRESHOLD
 
             # Clean up variable font data
             self._remove_vf_tables(instance_font)
@@ -1462,7 +1560,7 @@ class InstanceGenerator:
             self._update_metrics_and_bits(instance_font, is_italic, coordinates)
 
             # Correct italic angle if needed
-            if not is_italic and abs(italic_angle) > 0.01:
+            if not is_italic and abs(italic_angle) > ITALIC_ANGLE_MIN:
                 instance_font["post"].italicAngle = 0.0
 
             # Save
@@ -1569,7 +1667,7 @@ class InstanceGenerator:
         """Update font name table."""
         name_table = font["name"]
 
-        family_name = name_table.getDebugName(1) or "Unknown"
+        family_name = name_table.getDebugName(1) or UNKNOWN_FVAR_NAME
         family_name = strip_variable_tokens(family_name) or family_name
 
         weight = coordinates.get("wght", WeightClass.REGULAR)
@@ -1694,11 +1792,36 @@ class InstanceGenerator:
         return ".ttf"
 
     def _save_instance(self, font: TTFont, subfamily_name: str) -> str:
-        """Save instance font to file."""
+        """Save instance font to file.
+
+        Generates filename from PostScript name (nameID 6) or constructs it from
+        family name and subfamily name. Handles duplicate filenames by appending
+        a tilde-prefixed counter (e.g., "Font~001.ttf", "Font~002.ttf").
+
+        Duplicate handling strategy:
+        1. Check if base filename exists
+        2. If exists, increment counter and try again (up to 1000 attempts)
+        3. Handle race conditions where file is created between exists() check
+           and save() call by catching OSError/FileExistsError and retrying
+
+        In dry-run mode, logs the path that would be used without actually saving.
+
+        Args:
+            font: TTFont object to save
+            subfamily_name: Subfamily name for filename construction if PostScript
+                name is unavailable
+
+        Returns:
+            Absolute path string of saved file (or would-be path in dry-run mode)
+
+        Raises:
+            RuntimeError: If unable to save after 1000 attempts (shouldn't happen
+                in normal operation)
+        """
         # Use PostScript name (ID6)
         ps_name = font["name"].getDebugName(6)
         if not ps_name:
-            family = font["name"].getDebugName(16) or "Unknown"
+            family = font["name"].getDebugName(16) or UNKNOWN_FVAR_NAME
             ps_name = sanitize_postscript(f"{family}-{subfamily_name}")
 
         # Detect correct extension
@@ -1708,16 +1831,43 @@ class InstanceGenerator:
         output_dir = self.config.output_dir or Path(self.analyzer.font_path).parent
         output_path = output_dir / filename
 
-        # Handle duplicates
+        # Handle duplicates and race conditions
         counter = 1
-        while output_path.exists():
-            base = ps_name.rsplit(".", 1)[0] if "." in ps_name else ps_name
-            filename = f"{base}~{counter:03d}{extension}"
-            output_path = output_dir / filename
-            counter += 1
-
-        font.save(str(output_path))
-        return str(output_path)
+        max_attempts = 1000  # Prevent infinite loops
+        attempts = 0
+        
+        while attempts < max_attempts:
+            # Check if file exists (for initial duplicate detection)
+            if output_path.exists():
+                base = ps_name.rsplit(".", 1)[0] if "." in ps_name else ps_name
+                filename = f"{base}~{counter:03d}{extension}"
+                output_path = output_dir / filename
+                counter += 1
+                attempts += 1
+                continue
+            
+            # Dry-run mode: log what would be saved without actually saving
+            if self.config.dry_run:
+                logger.info(f"[DRY-RUN] Would save: {output_path}")
+                return str(output_path)
+            
+            # Attempt to save with race condition handling
+            try:
+                font.save(str(output_path))
+                return str(output_path)
+            except (OSError, FileExistsError) as e:
+                # Race condition: file was created between exists() check and save()
+                # Retry with incremented counter
+                base = ps_name.rsplit(".", 1)[0] if "." in ps_name else ps_name
+                filename = f"{base}~{counter:03d}{extension}"
+                output_path = output_dir / filename
+                counter += 1
+                attempts += 1
+                logger.debug(f"Race condition detected, retrying with filename: {filename}")
+                continue
+        
+        # If we've exhausted attempts, raise an error
+        raise RuntimeError(f"Could not save file after {max_attempts} attempts. Last attempted path: {output_path}")
 
 
 # ============================================================================
@@ -1778,13 +1928,15 @@ class FontProcessor:
                 break
 
             coordinates, custom_name = result
-            print(f"\nGenerating: {custom_name}")
+            dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
+            print(f"\n{dry_run_prefix}Generating: {custom_name}")
             output_path = generator.generate_instance(coordinates, custom_name)
 
             if output_path:
                 filename = Path(output_path).name
                 cs.emit("")
-                StatusIndicator("success").add_message("Generated").add_file(
+                status_msg = f"{dry_run_prefix}Generated" if dry_run_prefix else "Generated"
+                StatusIndicator("success").add_message(status_msg).add_file(
                     filename, filename_only=True
                 ).emit()
 
@@ -1794,8 +1946,9 @@ class FontProcessor:
 
         if generator.successful_count > 0:
             output_dir = self.config.output_dir or Path(self.font_path).parent
+            dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
             print(
-                f"\nGenerated {generator.successful_count} instance(s) in: {output_dir}"
+                f"\n{dry_run_prefix}Generated {generator.successful_count} instance(s) in: {output_dir}"
             )
 
     def run_instance_mode(self) -> None:
@@ -1827,8 +1980,9 @@ class FontProcessor:
         self.last_generator = generator
 
         if not instances_with_modes:  # Generate all
+            dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
             cs.emit(
-                f"\nGenerating {cs.fmt_count(len(self.metadata.instances))} instances..."
+                f"\n{dry_run_prefix}Generating {cs.fmt_count(len(self.metadata.instances))} instances..."
             )
 
             for inst_num, inst in enumerate(self.metadata.instances, 1):
@@ -1837,11 +1991,13 @@ class FontProcessor:
                 output_path = generator.generate_instance(inst.coordinates, final_name)
                 if output_path:
                     filename = Path(output_path).name
-                    cs.emit(f"  [{inst_num}] Generated: {filename}")
+                    dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
+                    cs.emit(f"  [{inst_num}] {dry_run_prefix}Generated: {filename}")
 
         else:  # Generate specific instances
+            dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
             cs.emit(
-                f"\nGenerating {cs.fmt_count(len(instances_with_modes))} instance(s)..."
+                f"\n{dry_run_prefix}Generating {cs.fmt_count(len(instances_with_modes))} instance(s)..."
             )
 
             for idx, mode in instances_with_modes:
@@ -1857,13 +2013,15 @@ class FontProcessor:
                 output_path = generator.generate_instance(inst.coordinates, final_name)
                 if output_path:
                     filename = Path(output_path).name
-                    cs.emit(f"  [{inst_num}] Generated: {filename}")
+                    dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
+                    cs.emit(f"  [{inst_num}] {dry_run_prefix}Generated: {filename}")
 
         if generator.successful_count > 0:
             output_dir = self.config.output_dir or Path(self.font_path).parent
             cs.emit("")
+            dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
             StatusIndicator("success").add_message(
-                f"Generated {cs.fmt_count(generator.successful_count)} instance(s)"
+                f"{dry_run_prefix}Generated {cs.fmt_count(generator.successful_count)} instance(s)"
             ).add_item(
                 f"Output directory: {cs.fmt_file_compact(str(output_dir))}"
             ).emit()
@@ -1891,8 +2049,9 @@ class FontProcessor:
         self.last_generator = generator
 
         mode_label = self.config.naming_mode.value
+        dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
         cs.emit(
-            f"Auto-generating {cs.fmt_count(len(self.metadata.instances))} instances ({mode_label} names)..."
+            f"{dry_run_prefix}Auto-generating {cs.fmt_count(len(self.metadata.instances))} instances ({mode_label} names)..."
         )
 
         for inst_num, inst in enumerate(self.metadata.instances, 1):
@@ -1906,8 +2065,9 @@ class FontProcessor:
         if generator.successful_count > 0:
             output_dir = self.config.output_dir or Path(self.font_path).parent
             cs.emit("")
+            dry_run_prefix = "[DRY-RUN] " if self.config.dry_run else ""
             StatusIndicator("success").add_message(
-                f"Generated {cs.fmt_count(generator.successful_count)} instance(s)"
+                f"{dry_run_prefix}Generated {cs.fmt_count(generator.successful_count)} instance(s)"
             ).add_item(f"Output: {cs.fmt_file_compact(str(output_dir))}").emit()
 
 
@@ -2206,7 +2366,7 @@ fvar-raw Names (-r)
             StatusIndicator("error").add_message("Font file not found").add_file(
                 args.font, filename_only=False
             ).emit()
-        return 1
+            return 1
 
         cs.fmt_header("Variable Font Instancer - Custom Instance Builder", console)
 
@@ -2224,7 +2384,7 @@ fvar-raw Names (-r)
             StatusIndicator("error").add_message(
                 "Failed to process font"
             ).with_explanation(str(e)).emit()
-        return 1
+            return 1
 
         return 0
 
