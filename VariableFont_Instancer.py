@@ -167,6 +167,13 @@ class NamingMode(Enum):
     FVAR_RAW = "fvar-raw"
 
 
+class PostScriptNamingMode(Enum):
+    """PostScript name source for instance filenames and nameID 6."""
+
+    DEFAULT_PS = "default-ps"
+    FVAR_PS = "fvar-ps"
+
+
 class WeightClass:
     """Standard weight class values."""
 
@@ -207,6 +214,53 @@ def _collapse_name_key(name: str) -> str:
     return re.sub(r"\s+", " ", name.strip()).casefold()
 
 
+def build_default_postscript_name(family_name: str, subfamily_name: str) -> str:
+    """Synthesized PostScript name (nameID 6) from family + subfamily."""
+    family = strip_variable_tokens(family_name.strip()) or family_name.strip()
+    return sanitize_postscript(f"{family}-{subfamily_name}")
+
+
+def postscript_summary_stem(ps_name: str) -> str:
+    """Family-side prefix for grouping (concatenated before the style hyphen).
+
+    Examples:
+        PlayfairMicro-SemiCondensedSemilight -> PlayfairMicro-
+        Playfair-Micro-SemiCondensedSemilight -> PlayfairMicro-  (legacy multi-hyphen)
+        Playfair-Regular -> Playfair-
+    """
+    ps = sanitize_postscript(ps_name.strip())
+    if not ps:
+        return "Unknown-"
+    if "-" not in ps:
+        return f"{ps}-"
+    family_part, _style = ps.rsplit("-", 1)
+    family_concat = family_part.replace("-", "")
+    return f"{family_concat}-"
+
+
+def fvar_postscript_coverage(instances: List["InstanceInfo"]) -> Tuple[int, int]:
+    """Return (instances_with_fvar_ps, total_instances)."""
+    total = len(instances)
+    covered = sum(1 for inst in instances if inst.fvar_ps_name)
+    return covered, total
+
+
+def aggregate_postscript_stems(
+    instances: List["InstanceInfo"],
+    resolve_postscript: Callable[["InstanceInfo"], str],
+) -> List[Tuple[str, int]]:
+    """Group instances by concatenated PostScript stem; preserve first-seen order."""
+    counts: Dict[str, int] = {}
+    order: List[str] = []
+    for inst in instances:
+        stem = postscript_summary_stem(resolve_postscript(inst))
+        if stem not in counts:
+            counts[stem] = 0
+            order.append(stem)
+        counts[stem] += 1
+    return [(stem, counts[stem]) for stem in order]
+
+
 @dataclass
 class InstancerConfig:
     """Configuration for instance processing."""
@@ -214,6 +268,8 @@ class InstancerConfig:
     output_dir: Optional[Path] = None
     keep_stat: bool = False
     naming_mode: NamingMode = NamingMode.STAT
+    postscript_mode: PostScriptNamingMode = PostScriptNamingMode.DEFAULT_PS
+    postscript_cli_locked: bool = False
     dry_run: bool = False
     skip_coordinate_duplicates: bool = True
 
@@ -259,6 +315,7 @@ class InstanceInfo:
     coordinates: Dict[str, float]
     is_italic: bool
     is_bold: bool
+    fvar_ps_name: Optional[str] = None
 
     def format_coordinates(self) -> str:
         """Format coordinates in canonical order: wdth → wght → slnt/ital."""
@@ -772,6 +829,24 @@ class FontAnalyzer:
 
         return metadata
 
+    def _resolve_name_id(self, name_id: Optional[int]) -> Optional[str]:
+        """Resolve a name table ID to a Unicode string."""
+        if not name_id or name_id == 0xFFFF:
+            return None
+        try:
+            name = self.font["name"].getDebugName(name_id)
+            if name:
+                return name
+            name_record = self.font["name"].getName(name_id, 3, 1, 0x409)
+            if name_record:
+                return name_record.toUnicode()
+            name_record = self.font["name"].getName(name_id, 1, 0, 0)
+            if name_record:
+                return name_record.toUnicode()
+        except Exception as e:
+            logger.debug(f"Failed to resolve nameID {name_id}: {e}")
+        return None
+
     def _extract_axes(self) -> List[AxisInfo]:
         """Extract axis information from fvar table."""
         axes: List[AxisInfo] = []
@@ -810,34 +885,13 @@ class FontAnalyzer:
         for i, instance in enumerate(fvar.instances):
             fvar_name = UNKNOWN_FVAR_NAME
             if hasattr(instance, "subfamilyNameID") and instance.subfamilyNameID:
-                try:
-                    # Try getDebugName first
-                    name = self.font["name"].getDebugName(instance.subfamilyNameID)
-                    if name:
-                        fvar_name = name
-                    else:
-                        # Fallback: try getName directly with different platforms
-                        name_record = self.font["name"].getName(
-                            instance.subfamilyNameID,
-                            3,
-                            1,
-                            0x409,  # Windows, Unicode, en-US
-                        )
-                        if name_record:
-                            fvar_name = name_record.toUnicode()
-                        else:
-                            # Try Mac platform
-                            name_record = self.font["name"].getName(
-                                instance.subfamilyNameID,
-                                1,
-                                0,
-                                0,  # Mac, Roman, English
-                            )
-                            if name_record:
-                                fvar_name = name_record.toUnicode()
-                except Exception as e:
-                    logger.debug(f"Failed to extract fvar name for instance {i}: {e}")
-                    fvar_name = UNKNOWN_FVAR_NAME
+                resolved = self._resolve_name_id(instance.subfamilyNameID)
+                if resolved:
+                    fvar_name = resolved
+
+            fvar_ps_name: Optional[str] = None
+            if hasattr(instance, "postscriptNameID"):
+                fvar_ps_name = self._resolve_name_id(instance.postscriptNameID)
 
             stat_name = self.stat_parser.build_subfamily_name(instance.coordinates)
             is_italic = self._detect_italic(instance.coordinates)
@@ -852,6 +906,7 @@ class FontAnalyzer:
                     coordinates=instance.coordinates,
                     is_italic=is_italic,
                     is_bold=is_bold,
+                    fvar_ps_name=fvar_ps_name,
                 )
             )
 
@@ -935,6 +990,7 @@ class InstanceNamingStrategy:
                     coordinates=inst.coordinates,
                     is_italic=inst.is_italic,
                     is_bold=inst.is_bold,
+                    fvar_ps_name=inst.fvar_ps_name,
                 )
                 return self.family_context.build_hybrid_name(temp_inst)
             return inst.stat_name
@@ -950,6 +1006,50 @@ class InstanceNamingStrategy:
             return inst.stat_name
 
         return inst.stat_name
+
+
+class InstancePostScriptResolver:
+    """Resolves PostScript names (nameID 6 / filenames) for instances."""
+
+    def __init__(
+        self,
+        metadata: FontMetadata,
+        mode: PostScriptNamingMode,
+        resolve_subfamily: Callable[[InstanceInfo], str],
+    ):
+        self.metadata = metadata
+        self.mode = mode
+        self.resolve_subfamily = resolve_subfamily
+
+    def resolve(self, inst: InstanceInfo) -> str:
+        if self.mode == PostScriptNamingMode.FVAR_PS and inst.fvar_ps_name:
+            return sanitize_postscript(inst.fvar_ps_name)
+        return build_default_postscript_name(
+            self.metadata.family_name, self.resolve_subfamily(inst)
+        )
+
+    def resolve_with_fallback_note(
+        self, inst: InstanceInfo
+    ) -> Tuple[str, bool]:
+        """Return (postscript_name, used_fvar_ps)."""
+        if self.mode == PostScriptNamingMode.FVAR_PS and inst.fvar_ps_name:
+            return sanitize_postscript(inst.fvar_ps_name), True
+        return build_default_postscript_name(
+            self.metadata.family_name, self.resolve_subfamily(inst)
+        ), False
+
+
+def build_postscript_resolver(
+    metadata: FontMetadata,
+    stat_parser: "STATNameParser",
+    naming_mode: NamingMode,
+    postscript_mode: PostScriptNamingMode,
+) -> InstancePostScriptResolver:
+    """Build resolver pairing subfamily naming mode with PostScript source."""
+    subfamily_resolver = build_instance_output_name_resolver(
+        metadata, stat_parser, naming_mode
+    )
+    return InstancePostScriptResolver(metadata, postscript_mode, subfamily_resolver)
 
 
 # ============================================================================
@@ -1132,6 +1232,138 @@ class InteractivePrompt:
         """fvar-hybrid when fvar names exist; STAT otherwise."""
         return default_naming_mode_for_instances(self.metadata.instances)
 
+    def _print_postscript_summary(
+        self,
+        instances: List[InstanceInfo],
+        naming_mode: NamingMode,
+        *,
+        selected_mode: Optional[PostScriptNamingMode] = None,
+        selection_label: Optional[str] = None,
+    ) -> Tuple[int, int]:
+        """Print grouped PostScript stem summary. Returns fvar PS coverage (covered, total)."""
+        default_resolver = build_postscript_resolver(
+            self.metadata,
+            self.stat_parser,
+            naming_mode,
+            PostScriptNamingMode.DEFAULT_PS,
+        )
+        fvar_resolver = build_postscript_resolver(
+            self.metadata,
+            self.stat_parser,
+            naming_mode,
+            PostScriptNamingMode.FVAR_PS,
+        )
+
+        covered, total = fvar_postscript_coverage(instances)
+        default_stems = aggregate_postscript_stems(instances, default_resolver.resolve)
+        fvar_stems = aggregate_postscript_stems(instances, fvar_resolver.resolve)
+
+        cs.emit("")
+        cs.emit("─" * 70)
+        cs.emit("POSTSCRIPT NAMING")
+        cs.emit("─" * 70)
+        if selection_label:
+            _emit_dim(f"  {selection_label}")
+        cs.emit(
+            "  Display names (ID 17) follow the subfamily naming mode; "
+            "PostScript / filename use the choice below."
+        )
+        cs.emit("")
+
+        default_tag = ""
+        if selected_mode == PostScriptNamingMode.DEFAULT_PS:
+            default_tag = "  ← selected"
+        cs.emit(f"  default PS (-ps):{default_tag}")
+        for stem, count in default_stems:
+            cs.emit(f"    {stem:<28} [{count}]")
+
+        cs.emit("")
+        if covered == 0:
+            cs.emit("  fvar PS (-fps):  not available (no fvar postscriptNameID entries)")
+        else:
+            fvar_tag = ""
+            if selected_mode == PostScriptNamingMode.FVAR_PS:
+                fvar_tag = "  ← selected"
+            cs.emit(f"  fvar PS (-fps):{fvar_tag}")
+            for stem, count in fvar_stems:
+                cs.emit(f"    {stem:<28} [{count}]")
+            if covered < total:
+                missing = total - covered
+                _emit_dim(
+                    f"    ({missing} instance(s) missing fvar PS — would fall back to default PS)"
+                )
+
+        cs.emit("")
+        return covered, total
+
+    def show_postscript_selection(
+        self,
+        *,
+        selection_instances: Optional[List[InstanceInfo]] = None,
+        naming_mode: Optional[NamingMode] = None,
+        preselected: Optional[PostScriptNamingMode] = None,
+        preselected_label: Optional[str] = None,
+    ) -> Optional[PostScriptNamingMode]:
+        """PostScript naming checkpoint before instance selection.
+
+        Returns None when the user skips this font ([x]).
+        """
+        instances = selection_instances or self.metadata.instances
+        mode = naming_mode or self._default_naming_mode()
+
+        while True:
+            self._print_header("PostScript Naming")
+            covered, _total = self._print_postscript_summary(
+                instances,
+                mode,
+                selected_mode=preselected,
+                selection_label=preselected_label,
+            )
+
+            if preselected is not None:
+                if (
+                    preselected == PostScriptNamingMode.FVAR_PS
+                    and covered == 0
+                ):
+                    StatusIndicator("warning").add_message(
+                        "-fps requested but no fvar PostScript names found — using default PS"
+                    ).emit()
+                    return PostScriptNamingMode.DEFAULT_PS
+                return preselected
+
+            cs.emit("")
+            if covered > 0:
+                _emit_menu_row(
+                    "PostScript source",
+                    "[Enter] default PS (-ps)   [fps] fvar PS (-fps)",
+                )
+            else:
+                _emit_menu_row(
+                    "PostScript source",
+                    "[Enter] default PS (-ps)",
+                    dim_hint="fvar PS unavailable for this font",
+                )
+            cs.emit("")
+            _emit_menu("                  [x] skip this font   [q] quit")
+
+            response = input("  > ").strip().lower()
+            if response in ("q", "quit"):
+                raise SystemExit(0)
+            rsp0 = response.split()[0] if response else ""
+            if rsp0 in ("x", "skip"):
+                return None
+            if response in ("fps", "fvar", "fvar-ps", "fvarps"):
+                if covered == 0:
+                    StatusIndicator("warning").add_message(
+                        "No fvar PostScript names — keeping default PS"
+                    ).emit()
+                    return PostScriptNamingMode.DEFAULT_PS
+                return PostScriptNamingMode.FVAR_PS
+            if response in ("", "ps", "default", "default-ps", "defaultps"):
+                return PostScriptNamingMode.DEFAULT_PS
+
+            _emit_dim("  Enter ps or fps, [x] to skip this font, or [q] to quit.")
+
     def _parse_numbers_only(
         self, response: str
     ) -> Optional[List[Tuple[int, NamingMode]]]:
@@ -1231,6 +1463,15 @@ class InteractivePrompt:
             cs.emit(
                 "  • fvar names come from fvar instance records (legacy compatibility)"
             )
+
+        naming_mode = self._default_naming_mode()
+        selection, _ = instances_for_processing(
+            self.metadata,
+            InstancerConfig(naming_mode=naming_mode),
+            self.stat_parser,
+            naming_mode,
+        )
+        self._print_postscript_summary(selection, naming_mode)
 
         # Validation
         self._print_validation_notices()
@@ -1434,6 +1675,7 @@ class InteractivePrompt:
             coordinates=inst.coordinates,
             is_italic=inst.is_italic,
             is_bold=inst.is_bold,
+            fvar_ps_name=inst.fvar_ps_name,
         )
         family_context = FamilyContext(self.metadata.instances, self.stat_parser)
         hybrid = family_context.build_hybrid_name(temp_inst)
@@ -1736,6 +1978,11 @@ class InteractivePrompt:
                 ]
 
             actions_section: List[str] = [
+                "",
+                "[bold]POSTSCRIPT[/bold]   [dim]ps · fps[/dim]",
+                "  Chosen before the instance table. Controls nameID 6 and filenames.",
+                "  [pale_green1]default PS[/pale_green1] (-ps)  family + subfamily, one hyphen",
+                "  [pale_green1]fvar PS[/pale_green1] (-fps)   fvar postscriptNameID when present",
                 "",
                 "[bold]GENERATE ALL[/bold]   [dim]Enter · s · f · r[/dim]",
                 "  All instances shown in the table, with the chosen naming mode.",
@@ -2423,7 +2670,10 @@ class InstanceGenerator:
         self.successful_count = 0
 
     def generate_instance(
-        self, coordinates: Dict[str, float], subfamily_name: str
+        self,
+        coordinates: Dict[str, float],
+        subfamily_name: str,
+        postscript_name: Optional[str] = None,
     ) -> Optional[str]:
         """Generate a single static instance.
 
@@ -2457,7 +2707,13 @@ class InstanceGenerator:
             self._remove_vf_name_ids(instance_font, vf_nameids)
 
             # Update naming
-            self._update_names(instance_font, subfamily_name, is_italic, coordinates)
+            self._update_names(
+                instance_font,
+                subfamily_name,
+                is_italic,
+                coordinates,
+                postscript_override=postscript_name,
+            )
 
             # Clean up Mac names if requested
             # Always remove Mac platform records
@@ -2570,6 +2826,7 @@ class InstanceGenerator:
         subfamily_name: str,
         is_italic: bool,
         coordinates: Dict[str, float],
+        postscript_override: Optional[str] = None,
     ) -> None:
         """Update font name table."""
         name_table = font["name"]
@@ -2619,7 +2876,10 @@ class InstanceGenerator:
         id4 = f"{family_name} {style_clean}" if style_clean else family_name
 
         # ID6: PostScript
-        ps_name = sanitize_postscript(f"{family_name}-{id17}")
+        if postscript_override:
+            ps_name = sanitize_postscript(postscript_override)
+        else:
+            ps_name = build_default_postscript_name(family_name, id17)
 
         id16 = family_name
 
@@ -2967,6 +3227,26 @@ class FontProcessor:
             naming_mode=default_naming_mode_for_instances(self.metadata.instances),
         )
 
+        ps_preview_mode = default_naming_mode_for_instances(self.metadata.instances)
+        ps_label = None
+        if self.config.postscript_cli_locked:
+            if self.config.postscript_mode == PostScriptNamingMode.FVAR_PS:
+                ps_label = "CLI: -fps (fvar PostScript)"
+            else:
+                ps_label = "CLI: -ps (default PostScript)"
+
+        ps_mode = ui.show_postscript_selection(
+            selection_instances=selection,
+            naming_mode=ps_preview_mode,
+            preselected=(
+                self.config.postscript_mode if self.config.postscript_cli_locked else None
+            ),
+            preselected_label=ps_label,
+        )
+        if ps_mode is None:
+            return
+        self.config.postscript_mode = ps_mode
+
         while True:
             result = ui.show_instance_selection()
             if result is None:
@@ -3001,19 +3281,40 @@ class FontProcessor:
             cs.emit(
                 f"\nGenerating {cs.fmt_count(len(selection))} instances..."
             )
+            ps_resolver = build_postscript_resolver(
+                self.metadata,
+                self.stat_parser,
+                default_mode,
+                self.config.postscript_mode,
+            )
+            fvar_ps_fallbacks = 0
 
             for inst_num, inst in enumerate(selection, 1):
                 final_name = naming_strategy.resolve_name(inst)
+                ps_name, used_fvar = ps_resolver.resolve_with_fallback_note(inst)
+                if (
+                    self.config.postscript_mode == PostScriptNamingMode.FVAR_PS
+                    and not used_fvar
+                ):
+                    fvar_ps_fallbacks += 1
 
-                output_path = generator.generate_instance(inst.coordinates, final_name)
+                output_path = generator.generate_instance(
+                    inst.coordinates, final_name, ps_name
+                )
                 if output_path:
                     filename = Path(output_path).name
                     cs.emit(f"  [{inst_num}] Generated: {filename}")
+
+            if fvar_ps_fallbacks:
+                StatusIndicator("warning").add_message(
+                    f"{fvar_ps_fallbacks} instance(s) missing fvar PS — used default PS"
+                ).emit()
 
         else:  # Generate specific instances
             cs.emit(
                 f"\nGenerating {cs.fmt_count(len(instances_with_modes))} instance(s)..."
             )
+            fvar_ps_fallbacks = 0
 
             for idx, mode in instances_with_modes:
                 inst = selection[idx]
@@ -3024,11 +3325,30 @@ class FontProcessor:
                     self.metadata, self.stat_parser, mode
                 )
                 final_name = specific_strategy.resolve_name(inst)
+                ps_resolver = build_postscript_resolver(
+                    self.metadata,
+                    self.stat_parser,
+                    mode,
+                    self.config.postscript_mode,
+                )
+                ps_name, used_fvar = ps_resolver.resolve_with_fallback_note(inst)
+                if (
+                    self.config.postscript_mode == PostScriptNamingMode.FVAR_PS
+                    and not used_fvar
+                ):
+                    fvar_ps_fallbacks += 1
 
-                output_path = generator.generate_instance(inst.coordinates, final_name)
+                output_path = generator.generate_instance(
+                    inst.coordinates, final_name, ps_name
+                )
                 if output_path:
                     filename = Path(output_path).name
                     cs.emit(f"  [{inst_num}] Generated: {filename}")
+
+            if fvar_ps_fallbacks:
+                StatusIndicator("warning").add_message(
+                    f"{fvar_ps_fallbacks} instance(s) missing fvar PS — used default PS"
+                ).emit()
 
         if generator.successful_count > 0:
             output_dir = self.config.output_dir or Path(self.font_path).parent
@@ -3057,6 +3377,17 @@ class FontProcessor:
         self.metadata = self.analyzer.analyze()
         self.stat_parser = self.analyzer.stat_parser
 
+        covered, _total = fvar_postscript_coverage(self.metadata.instances)
+        if (
+            self.config.postscript_mode == PostScriptNamingMode.FVAR_PS
+            and covered == 0
+        ):
+            if not json_output:
+                StatusIndicator("warning").add_message(
+                    "-fps requested but no fvar PostScript names found — using default PS"
+                ).emit()
+            self.config.postscript_mode = PostScriptNamingMode.DEFAULT_PS
+
         naming_strategy = InstanceNamingStrategy(
             self.metadata, self.stat_parser, self.config.naming_mode
         )
@@ -3083,16 +3414,34 @@ class FontProcessor:
             ]
 
         if not json_output:
-            has_fvar_names = any(
-                inst.fvar_name != UNKNOWN_FVAR_NAME
-                for inst in self.metadata.instances
-            )
+            ps_label = None
+            if self.config.postscript_cli_locked:
+                if self.config.postscript_mode == PostScriptNamingMode.FVAR_PS:
+                    ps_label = "CLI: -fps (fvar PostScript)"
+                else:
+                    ps_label = "CLI: -ps (default PostScript)"
+            elif self.config.postscript_mode == PostScriptNamingMode.FVAR_PS:
+                ps_label = "Auto: fvar PostScript (-fps)"
+            else:
+                ps_label = "Auto: default PostScript (-ps)"
+
             ui = InteractivePrompt(
                 self.metadata,
                 self.stat_parser,
                 selection_instances=selection,
                 coordinate_dedupe_active=self.config.skip_coordinate_duplicates,
                 naming_mode=self.config.naming_mode,
+            )
+            ui._print_postscript_summary(
+                selection,
+                self.config.naming_mode,
+                selected_mode=self.config.postscript_mode,
+                selection_label=ps_label,
+            )
+
+            has_fvar_names = any(
+                inst.fvar_name != UNKNOWN_FVAR_NAME
+                for inst in self.metadata.instances
             )
             ui._print_header("Named Instances")
             any_names_differ, has_dup_coords = ui._print_instances_table_with_naming(
@@ -3101,8 +3450,13 @@ class FontProcessor:
             )
             ui._print_table_legend(any_names_differ, has_dup_coords, has_fvar_names)
             mode_label = self.config.naming_mode.value
+            ps_label_short = (
+                "fvar PS" if self.config.postscript_mode == PostScriptNamingMode.FVAR_PS
+                else "default PS"
+            )
             cs.emit(
-                f"\nAuto-generating {cs.fmt_count(len(instances_to_generate))} instances ({mode_label} names)..."
+                f"\nAuto-generating {cs.fmt_count(len(instances_to_generate))} instances "
+                f"({mode_label} names, {ps_label_short})..."
             )
             if coord_dedupe_skipped > 0:
                 StatusIndicator("info").add_message(
@@ -3112,10 +3466,25 @@ class FontProcessor:
                 ).emit()
 
         generated_files = []
+        ps_resolver = build_postscript_resolver(
+            self.metadata,
+            self.stat_parser,
+            self.config.naming_mode,
+            self.config.postscript_mode,
+        )
+        fvar_ps_fallbacks = 0
         for inst_num, inst in enumerate(instances_to_generate, 1):
             final_name = naming_strategy.resolve_name(inst)
+            ps_name, used_fvar = ps_resolver.resolve_with_fallback_note(inst)
+            if (
+                self.config.postscript_mode == PostScriptNamingMode.FVAR_PS
+                and not used_fvar
+            ):
+                fvar_ps_fallbacks += 1
 
-            output_path = generator.generate_instance(inst.coordinates, final_name)
+            output_path = generator.generate_instance(
+                inst.coordinates, final_name, ps_name
+            )
             if output_path:
                 filename = Path(output_path).name
                 if json_output:
@@ -3127,6 +3496,11 @@ class FontProcessor:
                     })
                 else:
                     cs.emit(f"  [{inst_num}] Generated: {filename}")
+
+        if fvar_ps_fallbacks and not json_output:
+            StatusIndicator("warning").add_message(
+                f"{fvar_ps_fallbacks} instance(s) missing fvar PS — used default PS"
+            ).emit()
 
         if json_output:
             output = {
@@ -3400,6 +3774,14 @@ Naming Strategy Options
   %(prog)s font.ttf -y -r
       fvar-raw - use fvar names without modifications
 
+PostScript Naming (-ps / -fps)
+──────────────────────────────
+  %(prog)s font.ttf -y -fps
+      Use fvar postscriptNameID for filenames and nameID 6
+      
+  %(prog)s font.ttf -y -ps
+      Synthesized PostScript from family + subfamily (default)
+
 Output Control
 ──────────────
   %(prog)s font.ttf -y -os
@@ -3490,6 +3872,21 @@ fvar-raw Names (-r)
         "--fvar-raw",
         action="store_true",
         help="Use raw fvar names only",
+    )
+
+    # PostScript naming (mutually exclusive; default PS when neither flag is set)
+    ps_group = parser.add_mutually_exclusive_group()
+    ps_group.add_argument(
+        "-ps",
+        "--default-ps",
+        action="store_true",
+        help="Build PostScript names from family + subfamily (default)",
+    )
+    ps_group.add_argument(
+        "-fps",
+        "--fvar-ps",
+        action="store_true",
+        help="Use fvar postscriptNameID strings for PostScript / filenames",
     )
 
     # Quick instance generation
@@ -3711,6 +4108,14 @@ fvar-raw Names (-r)
     else:
         naming_mode = NamingMode.STAT  # default
 
+    postscript_mode = PostScriptNamingMode.DEFAULT_PS
+    postscript_cli_locked = False
+    if args.fvar_ps:
+        postscript_mode = PostScriptNamingMode.FVAR_PS
+        postscript_cli_locked = True
+    elif args.default_ps:
+        postscript_cli_locked = True
+
     # Determine output directory
     output_dir = None
     if args.output_dir:
@@ -3727,6 +4132,8 @@ fvar-raw Names (-r)
         output_dir=output_dir,
         keep_stat=args.keep_stat,
         naming_mode=naming_mode,
+        postscript_mode=postscript_mode,
+        postscript_cli_locked=postscript_cli_locked,
         dry_run=args.dry_run,
         skip_coordinate_duplicates=getattr(
             args, "skip_coordinate_duplicates", True
