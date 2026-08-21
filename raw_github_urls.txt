@@ -1,6 +1,7 @@
 # Root directory
 https://raw.githubusercontent.com/andrewsipe/Variable_Instancer/main/.gitmodules
 https://raw.githubusercontent.com/andrewsipe/Variable_Instancer/main/Adding static instances to variable fonts.md
+https://raw.githubusercontent.com/andrewsipe/Variable_Instancer/main/FontCore
 https://raw.githubusercontent.com/andrewsipe/Variable_Instancer/main/README.md
 https://raw.githubusercontent.com/andrewsipe/Variable_Instancer/main/VariableFont_Instancer.py
 https://raw.githubusercontent.com/andrewsipe/Variable_Instancer/main/VariableFont_TableEditor.py
@@ -35,6 +36,7 @@ https://raw.githubusercontent.com/andrewsipe/FontCore/main/core_namerecord_match
 https://raw.githubusercontent.com/andrewsipe/FontCore/main/core_namerecord_writer.py
 https://raw.githubusercontent.com/andrewsipe/FontCore/main/core_ot_label_reflow.py
 https://raw.githubusercontent.com/andrewsipe/FontCore/main/core_ot_label_scanner.py
+https://raw.githubusercontent.com/andrewsipe/FontCore/main/core_ot_label_suggest.py
 https://raw.githubusercontent.com/andrewsipe/FontCore/main/core_stat_builder.py
 https://raw.githubusercontent.com/andrewsipe/FontCore/main/core_string_utils.py
 https://raw.githubusercontent.com/andrewsipe/FontCore/main/core_ttx_table_io.py
